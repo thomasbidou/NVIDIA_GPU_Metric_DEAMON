@@ -1,0 +1,17 @@
+[Unit]
+Description=nvidia GPU stats HTTP daemon (nvidia-smi -> JSON)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=thomas
+WorkingDirectory=/home/thomas/gpu-stats
+ExecStart=/usr/bin/python3 /home/thomas/gpu-stats/server.py
+Restart=always
+RestartSec=3
+Environment=NVIDIA_GPU_STATS_PORT=8790
+Environment=NVIDIA_GPU_STATS_POLL=3
+
+[Install]
+WantedBy=multi-user.target
