@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -207,28 +208,8 @@ def collect_system() -> dict:
     }
 
 
-def collect() -> Optional[dict]:
-    """Run nvidia-smi + system metrics and return a snapshot dict."""
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu", QUERY, "--format=csv,noheader,nounits"],
-            text=True,
-            timeout=10,
-        )
-    except subprocess.SubprocessError as exc:
-        log.warning("nvidia-smi failed: %s", exc)
-        return None
-
-    lines = [ln for ln in out.splitlines() if ln.strip()]
-    if not lines:
-        return None
-
-    parts = [p.strip() for p in lines[0].split(",")]
-    # Expected order matches QUERY: 11 fields.
-    if len(parts) < 11:
-        log.warning("unexpected nvidia-smi column count: %d", len(parts))
-        return None
-
+def _gpu_from_parts(parts: list[str]) -> dict:
+    """Build one GPU dict from 11 nvidia-smi csv fields."""
     name, driver_version, uuid = parts[0], parts[1], parts[2]
     gpu_util = _to_float(parts[3])
     mem_util = _to_float(parts[4])
@@ -249,11 +230,10 @@ def collect() -> Optional[dict]:
         if (power_draw_w is not None and power_limit_w)
         else None
     )
-
-    result = {
+    return {
         "name": name,
-        "driver_version": driver_version,
         "uuid": uuid,
+        "driver_version": driver_version,
         "gpu_utilization_pct": gpu_util,
         "memory_used_pct": mem_util,
         "memory_used_gib": mem_used_gib,
@@ -263,11 +243,50 @@ def collect() -> Optional[dict]:
         "power_usage_pct": power_usage_pct,
         "temperature_c": temp_c,
         "fan_speed_pct": fan_pct,
+    }
+
+
+def collect() -> Optional[dict]:
+    """Run nvidia-smi + system metrics and return a snapshot dict.
+
+    New shape (v2):
+      { "box": ..., "gpus": [ {...}, ... ], "cpu": {...}, ... }
+    For backward compat with older integrations we ALSO keep the first
+    GPU's fields at the top level (v1 shape) and a convenience "name".
+    """
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu", QUERY, "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=10,
+        )
+    except subprocess.SubprocessError as exc:
+        log.warning("nvidia-smi failed: %s", exc)
+        return None
+
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    gpus: list[dict] = []
+    for ln in lines:
+        parts = [p.strip() for p in ln.split(",")]
+        if len(parts) < 11:
+            log.warning("unexpected nvidia-smi column count: %d", len(parts))
+            continue
+        gpus.append(_gpu_from_parts(parts))
+    if not gpus:
+        return None
+
+    first = gpus[0]
+    return {
+        # v2: explicit list (may contain multiple GPUs)
+        "gpus": gpus,
+        # v1 compat: first GPU promoted to top level
+        **first,
+        # system
+        "box": socket.gethostname(),
         "cpu": collect_system(),
         "poll_interval_s": POLL_INTERVAL_S,
         "collected_at": time.time(),
     }
-    return result
 
 
 class State:
