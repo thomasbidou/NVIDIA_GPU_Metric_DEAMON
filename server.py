@@ -1,20 +1,35 @@
 #!/usr/bin/env python3
 """nvidia_gpu stats daemon.
 
-Polls `nvidia-smi` on an interval and serves a small JSON document over
-HTTP so a remote Home Assistant instance (or anything else) can poll it
-without needing GPU drivers or the NVIDIA stack.
+Polls `nvidia-smi` + system metrics (CPU %, CPU temp, RAM) on an interval
+and serves a small JSON document over HTTP so a remote Home Assistant
+instance (or anything else) can poll it without needing GPU drivers or the
+NVIDIA stack.
 
 Stdlib only. No third-party deps.
 
 Endpoints:
   GET /            -> JSON snapshot (latest poll)
   GET /health      -> {"status": "ok"}
+
+Response shape (GPU fields at top level, system metrics under "cpu"):
+  {
+    "name": "...", "gpu_utilization_pct": ..., "memory_used_pct": ..., ...
+    "cpu": {
+      "name": "...",
+      "usage_pct": ...,
+      "temperature_c": ...,
+      "ram_used_gib": ...,
+      "ram_total_gib": ...,
+      "ram_used_pct": ...
+    }
+  }
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -23,8 +38,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 HOST = "0.0.0.0"
-PORT = int(__import__("os").environ.get("NVIDIA_GPU_STATS_PORT", "8790"))
-POLL_INTERVAL_S = float(__import__("os").environ.get("NVIDIA_GPU_STATS_POLL", "3"))
+PORT = int(os.environ.get("NVIDIA_GPU_STATS_PORT", "8790"))
+POLL_INTERVAL_S = float(os.environ.get("NVIDIA_GPU_STATS_POLL", "3"))
+
+# CPU usage: sample /proc/stat over this window (seconds).
+CPU_SAMPLE_S = 0.5
+# CPU temp: first hwmon that matches this name, else the first hwmon with
+# a temp1_input labelled "Tctl" (typical AMD) — else None.
+CPU_TEMP_CHIP = "k10temp"
 
 # nvidia-smi fields we need, with the csv query string.
 QUERY = (
@@ -55,8 +76,139 @@ def _to_int(s: str) -> Optional[int]:
     return None if f is None else int(f)
 
 
+def _read_int(path: str) -> Optional[int]:
+    try:
+        with open(path) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_str(path: str) -> Optional[str]:
+    try:
+        with open(path) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _cpu_usage_pct() -> Optional[float]:
+    """Sample /proc/stat twice and compute busy% over the window."""
+    def sample():
+        try:
+            with open("/proc/stat") as fh:
+                line = fh.readline().split()
+        except OSError:
+            return None
+        # user nice system idle iowait irq softirq steal ...
+        nums = list(map(int, line[1:]))
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+        total = sum(nums)
+        return idle, total
+
+    s1 = sample()
+    if s1 is None:
+        return None
+    time.sleep(CPU_SAMPLE_S)
+    s2 = sample()
+    if s2 is None:
+        return None
+    (idle1, total1), (idle2, total2) = s1, s2
+    d_total = total2 - total1
+    if d_total <= 0:
+        return None
+    d_busy = d_total - (idle2 - idle1)
+    return round(100.0 * d_busy / d_total, 1)
+
+
+def _cpu_temperature_c() -> Optional[int]:
+    """Find the CPU core temperature from /sys/class/hwmon."""
+    import glob
+
+    base = "/sys/class/hwmon"
+    try:
+        chips = sorted(os.listdir(base))
+    except OSError:
+        return None
+
+    def temp_of(chip: str) -> Optional[int]:
+        cdir = os.path.join(base, chip)
+        # Prefer a Tctl label (AMD), else temp1_input.
+        for f in sorted(glob.glob(os.path.join(cdir, "temp*_input"))):
+            label = _read_str(f.replace("_input", "_label")) or ""
+            if "Tctl" in label:
+                v = _read_int(f)
+                if v is not None:
+                    return v // 1000
+        # fallback: temp1_input
+        v = _read_int(os.path.join(cdir, "temp1_input"))
+        return None if v is None else v // 1000
+
+    for chip in chips:
+        if chip == CPU_TEMP_CHIP:
+            t = temp_of(chip)
+            if t is not None:
+                return t
+    # no named chip matched — return first plausible CPU-like chip
+    for chip in chips:
+        name = (_read_str(os.path.join(base, chip, "name")) or "").lower()
+        if name in ("k10temp", "cpu_thermal", "coretemp", "zenpower", "cpu"):
+            t = temp_of(chip)
+            if t is not None:
+                return t
+    return None
+
+
+def _cpu_name() -> Optional[str]:
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def collect_system() -> dict:
+    """Collect CPU %, CPU temp, and RAM metrics."""
+    def gib_kb(v: Optional[int]) -> Optional[float]:
+        return None if v is None else round(v / 1024.0 / 1024.0, 3)
+
+    mem = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                val = rest.strip().split()
+                if val:
+                    mem[key] = int(val[0])
+    except OSError:
+        pass
+
+    ram_total_kb = mem.get("MemTotal")
+    ram_available_kb = mem.get("MemAvailable")
+    ram_used_kb = (ram_total_kb - ram_available_kb) if (ram_total_kb and ram_available_kb is not None) else None
+    ram_used_gib = gib_kb(ram_used_kb)
+    ram_total_gib = gib_kb(ram_total_kb)
+    ram_used_pct = (
+        round(100.0 * ram_used_kb / ram_total_kb, 1)
+        if (ram_used_kb is not None and ram_total_kb)
+        else None
+    )
+
+    return {
+        "name": _cpu_name() or "CPU",
+        "usage_pct": _cpu_usage_pct(),
+        "temperature_c": _cpu_temperature_c(),
+        "ram_used_gib": ram_used_gib,
+        "ram_total_gib": ram_total_gib,
+        "ram_used_pct": ram_used_pct,
+    }
+
+
 def collect() -> Optional[dict]:
-    """Run nvidia-smi once and return a snapshot dict (or None on failure)."""
+    """Run nvidia-smi + system metrics and return a snapshot dict."""
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu", QUERY, "--format=csv,noheader,nounits"],
@@ -98,7 +250,7 @@ def collect() -> Optional[dict]:
         else None
     )
 
-    return {
+    result = {
         "name": name,
         "driver_version": driver_version,
         "uuid": uuid,
@@ -111,9 +263,11 @@ def collect() -> Optional[dict]:
         "power_usage_pct": power_usage_pct,
         "temperature_c": temp_c,
         "fan_speed_pct": fan_pct,
+        "cpu": collect_system(),
         "poll_interval_s": POLL_INTERVAL_S,
         "collected_at": time.time(),
     }
+    return result
 
 
 class State:
