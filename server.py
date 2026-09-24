@@ -212,7 +212,7 @@ def _gpu_from_parts(parts: list[str]) -> dict:
     """Build one GPU dict from 11 nvidia-smi csv fields."""
     name, driver_version, uuid = parts[0], parts[1], parts[2]
     gpu_util = _to_float(parts[3])
-    mem_util = _to_float(parts[4])
+    mem_controller_util = _to_float(parts[4])  # nvidia-smi memory-controller utilization (bandwidth), NOT "how full"
     mem_used_mib = _to_float(parts[5])
     mem_total_mib = _to_float(parts[6])
     power_draw_w = _to_float(parts[7])
@@ -225,6 +225,15 @@ def _gpu_from_parts(parts: list[str]) -> dict:
 
     mem_used_gib = gib(mem_used_mib)
     mem_total_gib = gib(mem_total_mib)
+    # memory_used_pct = "how full is the GPU memory" = used/total.
+    # Do NOT use nvidia-smi's utilization.memory for this: that is the
+    # memory-controller (bandwidth) utilization, which reads 0% on an idle
+    # GPU even when many GiB are allocated — confusing and wrong for a gauge.
+    mem_used_pct = (
+        round(100.0 * mem_used_mib / mem_total_mib, 1)
+        if (mem_used_mib is not None and mem_total_mib)
+        else None
+    )
     power_usage_pct = (
         round(100.0 * power_draw_w / power_limit_w, 2)
         if (power_draw_w is not None and power_limit_w)
@@ -235,9 +244,10 @@ def _gpu_from_parts(parts: list[str]) -> dict:
         "uuid": uuid,
         "driver_version": driver_version,
         "gpu_utilization_pct": gpu_util,
-        "memory_used_pct": mem_util,
+        "memory_used_pct": mem_used_pct,
         "memory_used_gib": mem_used_gib,
         "memory_total_gib": mem_total_gib,
+        "memory_controller_util_pct": mem_controller_util,
         "power_draw_w": power_draw_w,
         "power_limit_w": power_limit_w,
         "power_usage_pct": power_usage_pct,
