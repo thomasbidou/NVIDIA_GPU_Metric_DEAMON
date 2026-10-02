@@ -99,6 +99,12 @@ clients can read them.
   LAN). **Put a firewall / VLAN boundary in front of it** if the machine is
   reachable from untrusted networks — there is no auth by design.
 
+## Disclaimer
+
+This program was developed **entirely with AI assistance** (Hermes agent /
+language models). The code is provided **as-is, without warranty** — review it
+before running it in production.
+
 ## License
 
 MIT.
